@@ -20,11 +20,60 @@ from oauth2client.client import HttpAccessTokenRefreshError
 
 # Project imports
 import constants.cdr_cleaner.clean_cdr as cdr_consts
+from utils.sandbox import get_sandbox_table_name, get_sandbox_options
+from common import JINJA_ENV
 
 LOGGER = logging.getLogger(__name__)
 
 query_spec = NewType('QuerySpec', {})
 query_spec_list = List[query_spec]
+
+# A query for dropping all empty sandbox tables
+DROP_EMPTY_SANDBOX_TABLES_QUERY = JINJA_ENV.from_string("""
+DECLARE i INT64 DEFAULT 0;
+DECLARE tables DEFAULT (
+  SELECT
+    ARRAY_AGG(FORMAT("`%s.%s.%s`", project_id, dataset_id, table_id))
+  FROM
+    `{{project}}.{{dataset}}.__TABLES__`
+  WHERE
+    row_count = 0 AND table_id IN ({{table_ids}}));
+
+LOOP
+  SET i = i + 1;
+  IF i > ARRAY_LENGTH(tables) THEN 
+    LEAVE; 
+  END IF;
+  EXECUTE IMMEDIATE '''DROP TABLE ''' || tables[ORDINAL(i)];
+END LOOP
+""")
+
+
+def get_delete_empty_sandbox_tables_queries(project_id, sandbox_dataset_id,
+                                            sandbox_tablenames):
+    """
+    Generate the query that drop the empty sandbox tables
+    
+    :param project_id: 
+    :param sandbox_dataset_id: 
+    :param sandbox_tablenames: 
+    :return: 
+    """
+
+    # If there is not sandbox tables associated with the cleaning rule, return an empty list
+    if not sandbox_tablenames:
+        return list()
+
+    table_ids = ','.join(
+        map(lambda sandbox_table: f'"{sandbox_table}"', sandbox_tablenames))
+    return [{
+        cdr_consts.QUERY:
+            DROP_EMPTY_SANDBOX_TABLES_QUERY.render(project=project_id,
+                                                   dataset=sandbox_dataset_id,
+                                                   table_ids=table_ids),
+        cdr_consts.DESTINATION_DATASET:
+            sandbox_dataset_id
+    }]
 
 
 class AbstractBaseCleaningRule(ABC):
@@ -126,7 +175,9 @@ class BaseCleaningRule(AbstractBaseCleaningRule):
                  dataset_id: str = None,
                  sandbox_dataset_id: str = None,
                  depends_on: cleaning_class_list = None,
-                 affected_tables: List = None):
+                 affected_tables: List = None,
+                 table_namer: str = None,
+                 table_tag: str = None):
         """
         Instantiate a cleaning rule with basic attributes.
 
@@ -160,6 +211,9 @@ class BaseCleaningRule(AbstractBaseCleaningRule):
             scope may expand in the future.  Default is an empty list.
         :param affected_tables: a list of tables that are affected by
             running this cleaning rule.
+        :param table_namer: string used to help programmatically create
+            sandbox table names
+        :param table_tag: string used to create a label in the sandbox options
         """
         self._issue_numbers = issue_numbers
         self._description = description
@@ -170,6 +224,13 @@ class BaseCleaningRule(AbstractBaseCleaningRule):
         self._issue_urls = issue_urls if issue_urls else []
         self._depends_on_classes = depends_on if depends_on else []
         self._affected_tables = affected_tables
+        self._table_namer = table_namer
+        self._table_tag = table_tag
+
+        # fields jinja template
+        self.fields_templ = JINJA_ENV.from_string("""
+            {{name}} {{col_type}} {{mode}} OPTIONS(description="{{desc}}")
+        """)
 
         super().__init__()
 
@@ -334,6 +395,20 @@ class BaseCleaningRule(AbstractBaseCleaningRule):
         """
         return self._affected_tables
 
+    @property
+    def table_namer(self):
+        """
+        Get the table name of the sandbox for this class instance.
+        """
+        return self._table_namer
+
+    @property
+    def table_tag(self):
+        """
+        Get the table tag of the sandbox for this class instance.
+        """
+        return self._table_tag
+
     @affected_tables.setter
     def affected_tables(self, affected_tables):
         """
@@ -346,6 +421,17 @@ class BaseCleaningRule(AbstractBaseCleaningRule):
                 self._affected_tables = affected_tables
         else:
             self._affected_tables = []
+
+    @table_namer.setter
+    def table_namer(self, table_namer, **kwargs):
+        """
+        Set the table_namer for this class instance. If no value is provided, it is set to a default value.
+        """
+        if not table_namer:
+            for key, value in kwargs.items():
+                self._table_namer = kwargs.get(value)
+        else:
+            self._table_namer = table_namer
 
     def get_table_counts(self, client, dataset, tables):
         """
@@ -404,11 +490,8 @@ class BaseCleaningRule(AbstractBaseCleaningRule):
         :param affected_table: 
         :return: 
         """
-        if affected_table not in self.affected_tables:
-            raise LookupError(
-                f'{affected_table} is not define as an affected table in {self.affected_tables}'
-            )
-        return f'{"_".join(self.issue_numbers).lower()}_{affected_table}'
+        base_name = f'{"_".join(self.issue_numbers).lower()}_{affected_table}'
+        return get_sandbox_table_name(self.table_namer, base_name)
 
     def log_queries(self):
         """
@@ -429,3 +512,93 @@ class BaseCleaningRule(AbstractBaseCleaningRule):
             LOGGER.info(
                 f"Generated SQL Query:\n{query.get(cdr_consts.QUERY, 'NO QUERY FOUND')}"
             )
+
+    def get_sandbox_options_string(self, shared=False):
+        """
+        Helper function to retrieve the sandbox options which includes the description and labels
+
+        :param shared: boolean if the sandbox table will be shared
+        :return: string of the sandbox options
+        """
+        return get_sandbox_options(self.dataset_id,
+                                   self.__class__.__name__,
+                                   self.table_tag,
+                                   self.description,
+                                   shared_lookup=shared)
+
+    def get_bq_col_type(self, col_type):
+        """
+        Return correct SQL column type representation.
+
+        :param col_type: The type of column as defined in json schema files.
+
+        :return: A SQL column type compatible with BigQuery
+        """
+        lower_col_type = col_type.lower()
+        if lower_col_type == 'integer':
+            return 'INT64'
+
+        if lower_col_type == 'string':
+            return 'STRING'
+
+        if lower_col_type == 'float':
+            return 'FLOAT64'
+
+        if lower_col_type == 'numeric':
+            return 'DECIMAL'
+
+        if lower_col_type == 'time':
+            return 'TIME'
+
+        if lower_col_type == 'timestamp':
+            return 'TIMESTAMP'
+
+        if lower_col_type == 'date':
+            return 'DATE'
+
+        if lower_col_type == 'datetime':
+            return 'DATETIME'
+
+        if lower_col_type == 'bool':
+            return 'BOOL'
+
+        return 'UNSET'
+
+    def get_bq_mode(self, mode):
+        """
+        Return correct SQL for column mode.
+
+        :param mode:  either nullable or required as defined in json schema files.
+
+        :return: NOT NULL or empty string
+        """
+        lower_mode = mode.lower()
+        if lower_mode == 'nullable':
+            return ''
+
+        if lower_mode == 'required':
+            return 'NOT NULL'
+
+        return 'UNSET'
+
+    def get_bq_fields_sql(self, fields):
+        """
+        Get the SQL compliant fields definition from json fields object.
+
+        :param fields: table schema in json format
+
+        :return: a string that can be added to SQL to generate a correct
+            table.
+        """
+        fields_list = []
+        for field in fields:
+            rendered = self.fields_templ.render(
+                name=field.get('name'),
+                col_type=self.get_bq_col_type(field.get('type')),
+                mode=self.get_bq_mode(field.get('mode')),
+                desc=field.get('description'))
+
+            fields_list.append(rendered)
+
+        fields_str = ','.join(fields_list)
+        return fields_str

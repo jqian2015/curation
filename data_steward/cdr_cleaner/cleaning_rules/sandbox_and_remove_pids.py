@@ -1,10 +1,9 @@
 # Project imports
-import utils.bq
-from constants.cdr_cleaner import clean_cdr as clean_consts
 import constants.cdr_cleaner.clean_cdr as cdr_consts
-import bq_utils
+import utils.bq
 from constants import bq_utils as bq_consts
-from sandbox import get_sandbox_dataset_id
+from constants.cdr_cleaner import clean_cdr as clean_consts
+from utils.sandbox import get_sandbox_dataset_id
 
 # Query to create tables in sandbox with rows that will be removed per cleaning rule
 SANDBOX_QUERY = """
@@ -48,7 +47,11 @@ def get_tables_with_person_id(project_id, dataset_id):
     return person_table_list
 
 
-def get_sandbox_queries(project_id, dataset_id, pids, ticket_number):
+def get_sandbox_queries(project_id,
+                        dataset_id,
+                        pids,
+                        ticket_number,
+                        sandbox_dataset_id=None):
     """
     Returns a list of queries of all tables to be added to the datasets sandbox. These tables include all rows from all
     effected tables that include PIDs that will be removed by a specific cleaning rule.
@@ -57,8 +60,11 @@ def get_sandbox_queries(project_id, dataset_id, pids, ticket_number):
     :param dataset_id: bq dataset_id
     :param pids: list of person_ids from cleaning rule that need to be sandboxed and removed
     :param ticket_number: ticket number from jira that will be appended to the end of the sandbox table names
+    :param sandbox_dataset_id: name of the sandbox dataset
     :return: list of CREATE OR REPLACE queries to create tables in sandbox
     """
+    if sandbox_dataset_id is None:
+        sandbox_dataset_id = get_sandbox_dataset_id(dataset_id)
     person_tables_list = get_tables_with_person_id(project_id, dataset_id)
     queries_list = []
 
@@ -68,7 +74,7 @@ def get_sandbox_queries(project_id, dataset_id, pids, ticket_number):
             dataset=dataset_id,
             project=project_id,
             table=table,
-            sandbox_dataset=get_sandbox_dataset_id(dataset_id),
+            sandbox_dataset=sandbox_dataset_id,
             intermediary_table=table + '_' + ticket_number,
             # need to convert list of pids to string of pids
             pids=','.join([str(i) for i in pids]))

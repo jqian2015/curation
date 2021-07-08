@@ -2,6 +2,7 @@
 A utility to standardize use of the BigQuery python client library.
 """
 # Python Imports
+from datetime import datetime
 import logging
 import os
 import typing
@@ -13,7 +14,6 @@ from google.cloud import bigquery
 from google.auth import default
 
 # Project Imports
-from app_identity import PROJECT_ID
 from utils import auth
 from constants.utils import bq as consts
 from resources import fields_for
@@ -27,10 +27,10 @@ CREATE_OR_REPLACE_TABLE_TPL = JINJA_ENV.from_string("""
 CREATE OR REPLACE TABLE `{{project_id}}.{{dataset_id}}.{{table_id}}` (
 {% for field in schema -%}
   {{ field.name }} {{ field.field_type }} {% if field.mode == 'required' -%} NOT NULL {%- endif %}
-  {% if field.description %} OPTIONS (description="{{ field.description }}") {%- endif %} 
+  {% if field.description %} OPTIONS (description="{{ field.description }}") {%- endif %}
   {% if loop.nextitem %},{% endif -%}
 {%- endfor %} )
-{% if opts -%} 
+{% if opts -%}
 OPTIONS (
     {% for opt_name, opt_val in opts.items() -%}
     {{opt_name}}=
@@ -39,20 +39,20 @@ OPTIONS (
         {% elif opt_val is mapping %}
         [
             {% for opt_val_key, opt_val_val in opt_val.items() %}
-                ("{{opt_val_key}}", "{{opt_val_val}}"){% if loop.nextitem is defined %},{% endif %}       
+                ("{{opt_val_key}}", "{{opt_val_val}}"){% if loop.nextitem is defined %},{% endif %}
             {% endfor %}
         ]
         {% endif %}
-        {% if loop.nextitem is defined %},{% endif %} 
+        {% if loop.nextitem is defined %},{% endif %}
     {%- endfor %} )
 {%- endif %}
 {% if cluster_by_cols -%}
-CLUSTER BY 
+CLUSTER BY
 {% for col in cluster_by_cols -%}
     {{col}}{% if loop.nextitem is defined %},{% endif %}
-{%- endfor %}  
+{%- endfor %}
 {%- endif -%}
--- Note clustering/partitioning in conjunction with AS query_expression is -- 
+-- Note clustering/partitioning in conjunction with AS query_expression is --
 -- currently unsupported (see https://bit.ly/2VeMs7e) --
 {% if query -%} AS {{ query }} {%- endif %}
 """)
@@ -62,31 +62,26 @@ DATASET_COLUMNS_TPL = JINJA_ENV.from_string(consts.DATASET_COLUMNS_QUERY)
 TABLE_COUNT_TPL = JINJA_ENV.from_string(
     "SELECT COUNT(1) table_count FROM `{{dataset.project}}.{{dataset.dataset_id}}.__TABLES__`"
 )
-"""Query template to retrieve the number of tables in a dataset. 
-Requires parameter `dataset`: :class:`DatasetReference` and 
+"""Query template to retrieve the number of tables in a dataset.
+Requires parameter `dataset`: :class:`DatasetReference` and
 yields a scalar result with column `table_count`: :class:`int`."""
 
 
-def get_client(project_id=None, scopes=None):
+def get_client(project_id, scopes=None, credentials=None):
     """
     Get a client for a specified project.
 
     :param project_id:  Name of the project to create a bigquery library client for
-        It is being nice for now, but will begin to require users to provide
-        the project_id.
     :param scopes: List of Google scopes as strings
+    :param credentials: Google credentials object (ignored if scopes is defined,
+        uses delegated credentials instead)
 
     :return:  A bigquery Client object.
     """
     if scopes:
         credentials, project_id = default()
         credentials = auth.delegated_credentials(credentials, scopes=scopes)
-        return bigquery.Client(project=project_id, credentials=credentials)
-    if project_id is None:
-        LOGGER.info(f"You should specify project_id for a reliable experience."
-                    f"Defaulting to {os.environ.get(PROJECT_ID)}.")
-        return bigquery.Client()
-    return bigquery.Client(project=project_id)
+    return bigquery.Client(project=project_id, credentials=credentials)
 
 
 def get_table_schema(table_name, fields=None):
@@ -289,8 +284,8 @@ def create_tables(client,
 
 def query(q, project_id=None, use_cache=False):
     """
-    Deprecated: Execute a query and get results as a dataframe 
-     
+    Deprecated: Execute a query and get results as a dataframe
+
     :param q: the query to execute
     :param project_id: identifies the project associated with the query
     :param use_cache: if set to True, allow cached results
@@ -321,10 +316,10 @@ def list_datasets(project_id):
 def dataset_columns_query(project_id: str, dataset_id: str) -> str:
     """
     Get INFORMATION_SCHEMA.COLUMNS query for a specified dataset
- 
+
     :param project_id: identifies the project containing the dataset
     :param dataset_id: identifies the dataset whose metadata is queried
-    :return the query as a string 
+    :return the query as a string
     """
     return DATASET_COLUMNS_TPL.render(project_id=project_id,
                                       dataset_id=dataset_id)
@@ -418,6 +413,8 @@ def update_labels_and_tags(dataset_id,
             raise RuntimeError(f'Cannot update labels on dataset {dataset_id}'
                                f'without overwriting keys {overwrite_keys}')
         return {**existing_labels_or_tags, **updates}
+
+    return {**existing_labels_or_tags, **updates}
 
 
 def delete_dataset(project_id,
@@ -552,7 +549,7 @@ def to_scalar(
 ) -> typing.Any:
     """
     Get a scalar query result
-    
+
     :param result: a query job or a resultant :class:`bigquery.table.RowIterator`
     :return: the singular result value
     """
@@ -570,19 +567,19 @@ def to_scalar(
     _, row = next(enumerate(row_iter))
     if len(row_iter.schema) == 1:
         return row[0]
-    else:
-        return dict(row.items())
+
+    return dict(row.items())
 
 
 def get_table_count(client: bigquery.Client,
                     dataset: bigquery.DatasetReference) -> int:
     """
     Get the number of tables currently in a specified dataset
-    
-    :param client: active bigquery client 
+
+    :param client: active bigquery client
     :param dataset: the dataset
     :return: number of tables
-    :raises: 
+    :raises:
         google.cloud.exceptions.GoogleCloudError:
             If the job failed.
         concurrent.futures.TimeoutError:
@@ -597,10 +594,10 @@ def list_tables(
 ) -> typing.Iterator[bigquery.table.TableListItem]:
     """
     List all tables in a dataset
-    
+
     NOTE: Ensures all results are retrieved by first getting total
     table count and setting max_results in list tables API call
-     
+
     :param client: active bigquery client object
     :param dataset: the dataset containing the tables
     :return: tables contained within the requested dataset
@@ -608,3 +605,88 @@ def list_tables(
     table_count = get_table_count(client, dataset)
     return client.list_tables(dataset=dataset,
                               max_results=table_count + _MAX_RESULTS_PADDING)
+
+
+def copy_datasets(client: bigquery.Client, input_dataset, output_dataset):
+    """
+    Copies tables from source dataset to a destination datasets
+
+    :param client: an instantiated bigquery client object
+    :param input_dataset: name of the input dataset
+    :param output_dataset: name of the output dataset
+    :return:
+    """
+    # Copy input dataset tables to backup and staging datasets
+    tables = client.list_tables(input_dataset)
+    for table in tables:
+        staging_table = f'{output_dataset}.{table.table_id}'
+        client.copy_table(table, staging_table)
+
+
+def validate_bq_date_string(date_string):
+    """
+    Validates the date string is a valid date in the YYYY-MM-DD format.
+
+    If the string is valid, the string is returned.  Otherwise, strptime
+    raises either a ValueError or TypeError.
+
+    :param date_string: The string to validate adheres to YYYY-MM-DD format
+
+    :return:  a bq conforming date string
+    :raises:  A ValueError if the date string is not a valid date or
+        doesn't conform to the specified format.
+    """
+    datetime.strptime(date_string, '%Y-%m-%d')
+    return date_string
+
+
+def build_and_copy_contents(client, src_dataset, dest_dataset):
+    """
+    Uses google client object to copy non-schemaed data to schemaed table.
+
+    :param client: google client object with permissions
+    :param src_dataset: The dataset to copy data from
+    :param des_dataset: The dataset to copy data to.  It's tables are
+        created with valid schemas before inserting data.
+    """
+    LOGGER.info(f'Beginning copy of data from unschemaed dataset, '
+                f'`{src_dataset}`, to schemaed dataset, `{dest_dataset}`.')
+    table_list = client.list_tables(src_dataset)
+
+    for table_item in table_list:
+        # create empty schemaed tablle with client object
+        schema_list = get_table_schema(table_item.table_id)
+        dest_table = f'{client.project}.{dest_dataset}.{table_item.table_id}'
+        dest_table = bigquery.Table(dest_table, schema=schema_list)
+        dest_table = client.create_table(dest_table)  # Make an API request.
+        LOGGER.info(
+            f'Created empty table `{dest_table.project}.{dest_table.dataset_id}.{dest_table.table_id}`'
+        )
+
+        fields_name_str = ',\n'.join([item.name for item in schema_list])
+        # copy contents from non-schemaed source to schemaed dest
+        sql = (
+            f'SELECT {fields_name_str} '
+            f'FROM `{table_item.project}.{table_item.dataset_id}.{table_item.table_id}`'
+        )
+        job_config = bigquery.job.QueryJobConfig(
+            write_disposition=bigquery.job.WriteDisposition.WRITE_EMPTY,
+            priority=bigquery.job.QueryPriority.BATCH,
+            destination=dest_table,
+            labels={
+                'table_name': table_item.table_id,
+                'copy_from': table_item.dataset_id,
+                'copy_to': dest_dataset
+            })
+        job_id = (f'schemaed_copy_{table_item.table_id.lower()}_'
+                  f'{datetime.now().strftime("%Y%m%d_%H%M%S")}')
+        job = client.query(sql, job_config=job_config, job_id=job_id)
+        job.result()  # Wait for the job to complete.
+
+        LOGGER.info(
+            f'Table contents `{table_item.project}.{table_item.dataset_id}.'
+            f'{table_item.table_id}` were copied to `{dest_table.project}.'
+            f'{dest_table.dataset_id}.{dest_table.table_id}`')
+
+    LOGGER.info(f'Completed copy of data from unschemaed dataset, '
+                f'`{src_dataset}`, to schemaed dataset, `{dest_dataset}`.')

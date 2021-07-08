@@ -13,18 +13,19 @@ The intent of the get_participant_information function is to retrieve the inform
     are `participantId`, `firstName`, `middleName`, `lastName`, `streetAddress`, `streetAddress2`, `city`, `state`,
     `zipCode`, `phoneNumber`, `email`, `dateOfBirth`, `sex`
 """
+# Python imports
+import re
+import requests
 
 # Third party imports
-import re
 import pandas
-import requests
-import pandas_gbq
 import google.auth.transport.requests as req
 from google.auth import default
+from google.cloud.bigquery import LoadJobConfig
 
 # Project imports
 from utils import auth
-from resources import fields_for
+from utils.bq import get_client, get_table_schema
 
 FIELDS_OF_INTEREST_FOR_VALIDATION = [
     'participantId', 'firstName', 'middleName', 'lastName', 'streetAddress',
@@ -91,29 +92,20 @@ def get_participant_data(url, headers):
     return participant_data
 
 
-def get_deactivated_participants(project_id, dataset_id, tablename, columns):
+def get_deactivated_participants(api_project_id, columns):
     """
     Fetches all deactivated participants via API if suspensionStatus = 'NO_CONTACT'
     and stores all the deactivated participants in a BigQuery dataset table
 
-    :param project_id: The RDR project that contains participant summary data
-    :param dataset_id: The dataset name
-    :param tablename: The name of the table to house the deactivated participant data
+    :param api_project_id: The RDR project that contains participant summary data
     :param columns: columns to be pushed to a table in BigQuery in the form of a list of strings
 
     :return: returns dataframe of deactivated participants
     """
 
     # Parameter checks
-    if not isinstance(project_id, str):
+    if not isinstance(api_project_id, str):
         raise RuntimeError(f'Please specify the RDR project')
-
-    if not isinstance(dataset_id, str):
-        raise RuntimeError(f'Please provide a dataset_id')
-
-    if not isinstance(tablename, str):
-        raise RuntimeError(
-            f'Please provide a tablename to house deactivated participant data')
 
     if not isinstance(columns, list):
         raise RuntimeError(
@@ -123,13 +115,16 @@ def get_deactivated_participants(project_id, dataset_id, tablename, columns):
 
     headers = {
         'content-type': 'application/json',
-        'Authorization': 'Bearer {0}'.format(token)
+        'Authorization': f'Bearer {token}'
     }
+
+    field = 'NO_CONTACT'
 
     # Make request to get API version. This is the current RDR version for reference
     # See https://github.com/all-of-us/raw-data-repository/blob/master/opsdataAPI.md for documentation of this api.
-    url = 'https://{0}.appspot.com/rdr/v1/ParticipantSummary?_sort=lastModified&suspensionStatus={1}'.format(
-        project_id, 'NO_CONTACT')
+    url = (f'https://{api_project_id}.appspot.com/rdr/v1/ParticipantSummary'
+           f'?_sort=lastModified'
+           f'&suspensionStatus={field}')
 
     participant_data = get_participant_data(url, headers)
 
@@ -285,10 +280,13 @@ def store_participant_data(df, project_id, destination_table):
         raise RuntimeError(
             f'Please specify the project in which to create the tables')
 
-    table_schema = fields_for(destination_table.split('.')[-1])
+    client = get_client(project_id)
 
-    return pandas_gbq.to_gbq(df,
-                             destination_table,
-                             project_id,
-                             if_exists="replace",
-                             table_schema=table_schema)
+    load_job_config = LoadJobConfig(
+        schema=get_table_schema(destination_table.split('.')[-1]))
+    job = client.load_table_from_dataframe(df,
+                                           destination_table,
+                                           job_config=load_job_config)
+    job.result()
+
+    return job.job_id
